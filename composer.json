@@ -1,5 +1,8 @@
 {
     "name": "nikita/streams",
+    "require": {
+        "phpoption/phpoption": "~1"
+    },
     "require-dev": {
         "phpunit/phpunit": "~4"
     },
@@ -10,6 +13,5 @@
             "email": "inefedor@gmail.com"
         }
     ],
-    "minimum-stability": "dev",
-    "require": {}
+    "minimum-stability": "dev"
 }

@@ -33,12 +33,14 @@ $numberReverseFormatter = function ($v) use ($numbersReversed) {
 };
 
 $stuff = \Streams\Stream::from([1, 2, 3, 8, 5, 20, 131, 3425, 134])
-    ->produce($randProducer)
-    ->produce($randProducer)
+    ->flatMap($randProducer)
+    ->flatMap($randProducer)
     ->filter(function ($v) { return !($v % 3) || !($v % 2); })
     ->map($numberformatter)
-    ->produce(function ($formatted) { return explode(" ", $formatted); })
+    ->flatMap(function ($formatted) { return explode(" ", $formatted); })
     ->map($numberReverseFormatter)
+    ->skip(1000)
+    ->limit(200)
     ->compile()
 ;
 

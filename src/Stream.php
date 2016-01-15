@@ -2,6 +2,8 @@
 
 namespace Streams;
 
+use PhpOption\None;
+use PhpOption\Some;
 use Streams\Mapper\CallableMapper;
 use Streams\Mapper\Mapper;
 use Streams\Predicate\CallablePredicate;
@@ -12,6 +14,10 @@ use Streams\Producer\Producer;
 class Stream implements \IteratorAggregate
 {
 
+    public static $compileByDefault = true;
+
+    public static $compileAfterThreshold = 3;
+
     /**
      * @var array|\Traversable
      */
@@ -20,7 +26,7 @@ class Stream implements \IteratorAggregate
     /**
      * @var StreamProcessor[]
      */
-    protected $chain;
+    protected $processors;
 
     /**
      * @var bool
@@ -33,12 +39,28 @@ class Stream implements \IteratorAggregate
     protected $compiled;
 
     /**
+     * @var bool
+     */
+    protected $terminated;
+
+    /**
+     * @var int
+     */
+    protected $maxSize;
+
+    /**
+     * @var int
+     */
+    protected $startingFrom;
+
+    /**
      * @param array|\Traversable $data
      */
     public function __construct($data)
     {
         $this->data = $data;
         $this->compile = false;
+        $this->terminated = false;
     }
 
     /**
@@ -50,38 +72,83 @@ class Stream implements \IteratorAggregate
         return new Stream($data);
     }
 
-    /**
-     * @param callable $cb
-     * @return $this
-     */
-    public function filter(callable $cb)
+    public function allMatch(callable $predicate): bool
     {
-        $this->chain[] = new CallablePredicate($cb);
+        foreach ($this as $element) {
+            if ( ! $predicate($element)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public function anyMatch(callable $predicate): bool
+    {
+        foreach ($this as $element) {
+            if ($predicate($element)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function count(): int
+    {
+        if ( ! $this->processors && (is_array($this->data) || $this->data instanceof \Countable)) {
+            return count($this->data);
+        }
+
+        $result = 0;
+        foreach ($this as $_) {
+            $result++;
+        }
+
+        return $result;
+    }
+
+    public function filter(callable $predicate)
+    {
+        $this->processors[] = $predicate instanceof Predicate ? $predicate : new CallablePredicate($predicate);
         return $this;
     }
 
-    /**
-     * @param callable $cb
-     * @return $this
-     */
-    public function map(callable $cb)
+    public function map(callable $mapper)
     {
-        $this->chain[] = new CallableMapper($cb);
+        $this->processors[] = $mapper instanceof Mapper ? $mapper : new CallableMapper($mapper);
         return $this;
     }
 
-    /**
-     * @param callable $cb
-     * @return $this
-     */
-    public function produce(callable $cb)
+    public function flatMap(callable $producer)
     {
-        $this->chain[] = new CallableProducer($cb);
+        $this->processors[] = $producer instanceof Producer ? $producer : new CallableProducer($producer);
         return $this;
     }
 
+    public function limit(int $maxSize)
+    {
+        $this->maxSize = $maxSize;
+        return $this;
+    }
+
+    public function skip(int $n)
+    {
+        $this->startingFrom = $n;
+        return $this;
+    }
+
+    public function findFirst()
+    {
+        foreach ($this as $el) {
+            return new Some($el);
+        }
+
+        return None::create();
+    }
+
     /**
-     * @param callable(mixed $value, T $accumulated): T $cb
+     * @param callable(T $value, T $accumulated): T $cb
      * @param T $startFrom
      * @return T
      */
@@ -95,43 +162,44 @@ class Stream implements \IteratorAggregate
         return $accumulated;
     }
 
-    /**
-     * @param StreamProcessor $processor
-     * @return $this
-     */
     public function add(StreamProcessor $processor)
     {
-        $this->chain[] = $processor;
+        $this->processors[] = $processor;
         return $this;
     }
 
-    /**
-     * @inheritdoc
-     */
     public function getIterator()
     {
         if ($this->compile) {
             $closure = $this->compiled;
             return $closure($this->data);
         } else {
-            return $this->process($this->data, $this->chain);
+            $skip = $this->startingFrom === null ? 0 : $this->startingFrom;
+            $processed = 0;
+
+            return $this->process($this->data, $this->processors, $skip, $processed);
         }
     }
 
-    /**
-     * @return $this
-     */
     public function compile()
     {
+        $this->terminate();
+
         $code = 'return function ($data) {';
-        foreach ($this->chain as $idx => $processor) {
-            $code .= "\$p{$idx} = \$this->chain[{$idx}];";
+        foreach ($this->processors as $idx => $_) {
+            $code .= "\$p{$idx} = \$this->processors[{$idx}];";
         }
 
+        if ($this->startingFrom) {
+            $code .= '$skip = $this->startingFrom;';
+        }
+        if ($this->maxSize) {
+            $code .= '$limit = $this->maxSize;';
+        }
         $code .= 'foreach ($data as $key => $value) {';
 
         $layers = 0;
-        foreach ($this->chain as $idx => $processor) {
+        foreach ($this->processors as $idx => $processor) {
             if ($processor instanceof Mapper) {
                 $code .= "\$value = \$p{$idx}->map(\$value);";
             } elseif ($processor instanceof Predicate) {
@@ -142,15 +210,22 @@ class Stream implements \IteratorAggregate
             }
         }
 
-        for ($i = 0; $i <= $layers; $i++) {
-            if ($i === 0) {
-                $code .= 'yield $key => $value; }';
-            } else {
-                $code .= '}';
-            }
+        if ($this->startingFrom) {
+            $code .= 'if ($skip) {' .
+                         '--$skip;' .
+                         'continue;' .
+                     '}';
+        }
+        if ($this->maxSize) {
+            $code .= 'if ($limit-- === 0) {' .
+                         'return;' .
+                     '}';
         }
 
-        $code .= ' }; ';
+        $code .= 'yield $key => $value; }';
+        $code .= str_repeat('}', $layers);
+
+        $code .= ' };';
 
         $this->compiled = eval($code);
         $this->compile = true;
@@ -158,8 +233,11 @@ class Stream implements \IteratorAggregate
         return $this;
     }
 
-    protected function process($data, $chain)
+    protected function process($data, $chain, &$skip = 0, &$processed = 0)
     {
+        $this->terminate();
+        $limit = $this->maxSize;
+
         foreach ($data as $key => $value) {
             foreach ($chain as $procIdx => $processor) {
                 if ($processor instanceof Mapper) {
@@ -169,13 +247,38 @@ class Stream implements \IteratorAggregate
                         goto skip;
                     }
                 } elseif ($processor instanceof Producer) {
-                    yield from $this->process($processor->produce($value), array_slice($chain, $procIdx + 1));
+                    yield from $this->process($processor->produce($value), array_slice($chain, $procIdx + 1), $skip, $processed);
+
+                    if ($processed > $limit) {
+                        return;
+                    }
                     goto skip;
                 }
             }
 
+            if ($skip) {
+                --$skip;
+                continue;
+            }
+
+            if ($processed > $limit) {
+                return;
+            }
+
+            ++$processed;
             yield $key => $value;
             skip:
+        }
+    }
+
+    protected function terminate($onlyCheck = false)
+    {
+        if ($this->terminated) {
+            throw new IllegalStateException("This stream was already terminated");
+        }
+
+        if ( ! $onlyCheck) {
+            $this->terminated = true;
         }
     }
 }
